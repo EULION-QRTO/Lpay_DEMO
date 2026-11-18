@@ -4,7 +4,7 @@ import type { MenuBoardResponse, MenuResponse } from './dto'
 import waterImg from '../assets/water.png'
 import spoonImg from '../assets/spoon.png'
 
-export const DEMO_STORE_NAME = '라페이 데모 주점'
+export const DEMO_STORE_NAME = '어흥주막'
 export const DEMO_TABLE_NAME = '1'
 
 function emojiImage(emoji: string, bg: string): string {
