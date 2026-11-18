@@ -1,17 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { type Product, type TabKey, splitMenuBoard } from '../data'
-import { useSession, entryToken, stripOrderIdParam } from '../session'
+import { useSession, cleanUrlAfterPayment } from '../session'
 import { ApiError } from '../lib/api'
 import {
   menuBoard,
   createOrder,
-  requestPayment,
   callStaff,
   ordersByTable,
   ordersByPhone,
   cancelOrder,
-  getOrder,
+  cancelPendingOrders,
+  confirmPayment,
 } from '../lib/endpoints'
+import { subscribeOrderStatus } from '../lib/realtime'
 import type { OrderResponse } from '../lib/dto'
 import OrderScreen from './OrderScreen'
 import CartScreen from './CartScreen'
@@ -21,11 +22,28 @@ import HistoryScreen from './HistoryScreen'
 import DoneScreen from './DoneScreen'
 import PhoneEntryModal from './PhoneEntryModal'
 
+const CART_KEY = 'lpay-demo:cart'
+function loadCart(): Record<string, number> {
+  try {
+    return JSON.parse(sessionStorage.getItem(CART_KEY) ?? '{}') as Record<string, number>
+  } catch {
+    return {}
+  }
+}
+function saveCart(q: Record<string, number>) {
+  try {
+    sessionStorage.setItem(CART_KEY, JSON.stringify(q))
+  } catch {
+    /* noop */
+  }
+}
+
 type View = 'order' | 'cart' | 'pay' | 'pay-check' | 'history' | 'done'
 
 export default function StoreApp() {
-  const { session, phone, setPhone, returnOrderId } = useSession()
-  const [view, setView] = useState<View>(returnOrderId != null ? 'pay-check' : 'order')
+  const { session, phone, setPhone, paymentReturn } = useSession()
+  // 토스 결제창에서 성공으로 돌아왔으면 '결제 승인 중'에서 시작한다(실패 복귀는 아래 effect 가 장바구니로 보낸다).
+  const [view, setView] = useState<View>(paymentReturn?.result === 'success' ? 'pay-check' : 'order')
   const [historyReturn, setHistoryReturn] = useState<View>('order')
   const [tab, setTab] = useState<TabKey>('menu')
 
@@ -33,8 +51,9 @@ export default function StoreApp() {
   const [menu, setMenu] = useState<{ menu: Product[]; etc: Product[] } | null>(null)
   const [menuLoading, setMenuLoading] = useState(true)
 
-  // 장바구니: menuId(string) → 수량
-  const [quantities, setQuantities] = useState<Record<string, number>>({})
+  // 장바구니: menuId(string) → 수량. 결제창으로 페이지가 이동했다 돌아와도 유지되도록 sessionStorage 에 보관한다.
+  const [quantities, setQuantities] = useState<Record<string, number>>(loadCart)
+  useEffect(() => saveCart(quantities), [quantities])
 
   // 주문/결제
   const [order, setOrder] = useState<OrderResponse | null>(null)
@@ -50,20 +69,11 @@ export default function StoreApp() {
     setTimeout(() => setNotice(null), 2500)
   }, [])
 
-  const token = entryToken(session)
-
-  // 최신 view를 실시간 이벤트 핸들러(아래) 안에서 참조하기 위한 ref — 구독을 view 변경마다 끊고
-  // 다시 맺지 않기 위해 의존성 배열에는 넣지 않는다.
-  const viewRef = useRef(view)
-  useEffect(() => {
-    viewRef.current = view
-  }, [view])
-
   // 메뉴판 로드
   useEffect(() => {
     let alive = true
     setMenuLoading(true)
-    menuBoard(token)
+    menuBoard()
       .then((board) => {
         if (alive) setMenu(splitMenuBoard(board))
       })
@@ -76,72 +86,55 @@ export default function StoreApp() {
     return () => {
       alive = false
     }
-  }, [token, flash])
+  }, [flash])
 
-  // 페이앱 결제창에서 돌아온 경우(?orderId=) — 그 주문을 조회해 현재 상태로 화면을 맞춘다.
-  // 결제가 아직 안 끝났으면(PENDING_PAYMENT) '결제 확인 중' 화면에서 실시간 구독(아래)이 이어받는다.
+  // 토스 결제창에서 돌아온 경우(successUrl / failUrl) — 한 번만 처리한다.
+  //  · 성공: 승인 API 호출(주문 접수 처리) → 완료 화면
+  //  · 실패/취소: 결제대기 주문을 정리하고 장바구니로 복귀
   useEffect(() => {
-    if (returnOrderId == null) return
+    if (!paymentReturn) return
     let alive = true
     ;(async () => {
       try {
-        const o = await getOrder(returnOrderId, token)
-        if (!alive) return
-        setOrder(o)
-        if (o.status === 'CANCELED') {
-          flash('결제가 취소됐어요. 다시 주문해 주세요.')
-          setView('order')
-        } else if (o.status === 'PENDING_PAYMENT') {
-          setView('pay-check')
-        } else {
+        if (paymentReturn.result === 'success') {
+          const o = await confirmPayment(paymentReturn)
+          if (!alive) return
+          setOrder(o)
           setQuantities({})
           setView('done')
+        } else {
+          cancelPendingOrders(paymentReturn.orderId)
+          if (!alive) return
+          flash(
+            paymentReturn.code === 'PAY_PROCESS_CANCELED' || paymentReturn.code === 'USER_CANCEL'
+              ? '결제를 취소했어요.'
+              : paymentReturn.message,
+          )
+          setView('cart')
         }
       } catch (e) {
         if (!alive) return
-        flash(e instanceof ApiError ? e.message : '주문 정보를 불러오지 못했습니다.')
-        setView('order')
+        // 승인 실패(금액 불일치·승인 거절 등) — 대기 주문을 정리하고 다시 결제할 수 있게 장바구니로 돌려보낸다.
+        cancelPendingOrders(paymentReturn.result === 'success' ? paymentReturn.orderId : null)
+        flash(e instanceof ApiError ? e.message : '결제 승인에 실패했어요.')
+        setView('cart')
       } finally {
-        stripOrderIdParam()
+        if (alive) cleanUrlAfterPayment(session.mode)
       }
     })()
     return () => {
       alive = false
     }
-    // returnOrderId/token은 세션당 한 번만 정해지고 바뀌지 않는다 — 최초 1회만 실행하면 된다.
+    // 결제 복귀 정보는 페이지 로드 시 한 번 정해지고 바뀌지 않는다 — 최초 1회만 실행하면 된다.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [returnOrderId])
+  }, [])
 
-  // 결제대기/확인중 주문의 실시간 상태 구독 — 결제 확정(RECEIVED) → 조리중 → 완료 → 서빙/픽업,
-  // 취소·청산까지 전부 STATUS_CHANGED 로 온다. order.status/statusLabel 을 그대로 갱신하고,
-  // 결제대기/확인중 화면에 있었다면 결과에 따라 완료 화면(또는 취소 시 메뉴 화면)으로 넘긴다.
+  // 주문 상태 구독 — 결제 승인(RECEIVED) 이후 조리중 → 조리완료 → 서빙/픽업까지 시간이 지나며
+  // 자동으로 바뀐다(realtime.ts). order.status/statusLabel 만 갱신하면 완료 화면 배지가 따라 바뀐다.
   useEffect(() => {
     if (!order) return
-    let cancelled = false
-    let unsubscribe: (() => void) | undefined
-    // '../lib/realtime'(@stomp/stompjs 포함)는 주문이 생긴 이후에만 필요하므로, 여기서 동적
-    // import로 분리해둔다 — 메뉴만 보는 손님은 이 코드를 아예 받지 않는다(별도 청크).
-    import('../lib/realtime').then(({ subscribeOrderStatus }) => {
-      if (cancelled) return
-      unsubscribe = subscribeOrderStatus(token, order.id, (updated) => {
-        setOrder(updated)
-        const waitingForPayment = viewRef.current === 'pay' || viewRef.current === 'pay-check'
-        if (!waitingForPayment) return
-        if (updated.status === 'CANCELED') {
-          flash('결제가 취소됐어요.')
-          setQuantities({})
-          setView('order')
-        } else if (updated.status !== 'PENDING_PAYMENT') {
-          setQuantities({})
-          setView('done')
-        }
-      })
-    })
-    return () => {
-      cancelled = true
-      unsubscribe?.()
-    }
-  }, [order?.id, token, flash])
+    return subscribeOrderStatus(order.id, setOrder)
+  }, [order?.id])
 
   const allItems = useMemo(() => (menu ? [...menu.menu, ...menu.etc] : []), [menu])
   const priceById = useMemo(() => {
@@ -171,9 +164,9 @@ export default function StoreApp() {
     try {
       let list: OrderResponse[] = []
       if (session.mode === 'table') {
-        list = await ordersByTable(session.qrToken)
+        list = await ordersByTable()
       } else if (phone) {
-        list = await ordersByPhone(session.pickupToken, phone)
+        list = await ordersByPhone(phone)
       }
       setHistory(list)
     } catch (e) {
@@ -194,13 +187,8 @@ export default function StoreApp() {
     try {
       const created =
         session.mode === 'table'
-          ? await createOrder({ orderType: 'DINE_IN', qrToken: session.qrToken, items })
-          : await createOrder({
-              orderType: 'TAKEOUT',
-              pickupToken: session.pickupToken,
-              phoneNumber: phone,
-              items,
-            })
+          ? await createOrder({ orderType: 'DINE_IN', items })
+          : await createOrder({ orderType: 'TAKEOUT', phoneNumber: phone, items })
       setOrder(created)
       if (created.status === 'RECEIVED') {
         // 합계 0원 → 결제 없이 즉시 접수
@@ -216,60 +204,10 @@ export default function StoreApp() {
     }
   }
 
-  // 결제 요청(페이앱) — mock은 즉시 완료, live는 결제창(payUrl)을 새 탭에서 연다.
-  // 실제 결제 완료 판정은 페이앱 서버 통보로만 이루어지므로, 결과는 이 탭에 남아있는
-  // 실시간 구독(WebSocket)이 받아 처리한다 — 새 탭은 페이앱 결제 진행용일 뿐이다.
-  const startPayment = async () => {
-    if (!order || placing) return
-    setPlacing(true)
-    // 팝업 차단을 피하려면 window.open은 클릭(사용자 제스처) 안에서 "동기적으로" 호출해야
-    // 한다 — await 이후에 부르면 브라우저가 사용자가 시작한 동작으로 인정하지 않고 막는
-    // 경우가 많다(특히 모바일 Safari). 그래서 빈 탭을 먼저 열어두고, payUrl을 받으면
-    // 그 탭의 위치만 바꾼다.
-    const payWindow = window.open('', '_blank')
-    try {
-      const res = await requestPayment({ orderId: order.id, token })
-      if (res.status === 'PAID') {
-        payWindow?.close()
-        setOrder(res.order)
-        setQuantities({})
-        setView('done')
-      } else if (res.payUrl) {
-        if (payWindow) {
-          payWindow.location.href = res.payUrl
-          setView('pay-check') // 결제는 새 탭에서 진행 — 이 탭은 실시간 구독으로 결과를 기다린다
-        } else {
-          // 팝업이 차단된 경우 — 기존처럼 현재 탭에서 이동
-          window.location.href = res.payUrl
-        }
-      } else {
-        payWindow?.close()
-        flash('결제 페이지를 여는 데 실패했습니다.')
-      }
-    } catch (e) {
-      payWindow?.close()
-      flash(e instanceof ApiError ? e.message : '결제 요청에 실패했습니다.')
-    } finally {
-      setPlacing(false)
-    }
-  }
-
-  // '결제 확인 중' 화면의 취소 — 결제수단을 잘못 고르거나 더 담고 싶어진 손님을 위해,
-  // 페이앱 쪽 결제 요청은 신경 쓰지 않고(어차피 결제대기 주문 취소로 무효화됨) 이 탭에서
-  // 바로 장바구니로 돌아간다. 새 탭을 열었던 결제창은 그대로 두되(닫을 방법이 없음 — 이
-  // 탭에서 그 창을 참조하고 있지 않음), 이 탭의 주문만 취소하면 페이앱이 나중에 결제를
-  // 완료 통보해도 서버가 더 이상 유효하지 않은 주문으로 처리한다.
-  const cancelPendingPayment = () => {
-    if (!order) return
-    void cancelOrder(order.id, token).catch(() => {})
-    setOrder(null)
-    setView('cart')
-  }
-
   const staffCall = async () => {
     if (session.mode !== 'table') return
     try {
-      await callStaff(session.qrToken)
+      await callStaff()
       flash('직원을 호출했어요. 잠시만 기다려 주세요.')
     } catch (e) {
       flash(e instanceof ApiError ? e.message : '직원 호출에 실패했습니다.')
@@ -281,10 +219,10 @@ export default function StoreApp() {
     void placeOrder()
   }
 
-  // 결제대기 화면에서 뒤로 가기 — 서버에 남는 결제대기 주문을 실제로 취소한다(PENDING_PAYMENT 에서만 가능).
+  // 결제대기 화면에서 뒤로 가기 — 남는 결제대기 주문을 취소한다(PENDING_PAYMENT 에서만 가능).
   // 실패해도(이미 결제 확정 등) 어차피 화면은 장바구니로 돌아간다 — 손님이 다시 시도할 수 있게.
   const backFromPay = () => {
-    if (order) void cancelOrder(order.id, token).catch(() => {})
+    if (order) void cancelOrder(order.id).catch(() => {})
     setOrder(null)
     setView('cart')
   }
@@ -317,7 +255,7 @@ export default function StoreApp() {
   if (!phoneGate && view === 'pay-check') {
     return (
       <>
-        <PaymentCheckScreen onOpenHistory={openHistory} onCancel={cancelPendingPayment} />
+        <PaymentCheckScreen onOpenHistory={openHistory} />
         {noticeBar}
       </>
     )
@@ -332,15 +270,14 @@ export default function StoreApp() {
     )
   }
 
-  if (!phoneGate && view === 'pay') {
+  if (!phoneGate && view === 'pay' && order) {
     return (
       <>
         <PayScreen
-          amount={order?.totalPrice ?? total}
-          placing={placing}
+          orderId={order!.id}
           onBack={backFromPay}
-          onComplete={startPayment}
           onOpenHistory={openHistory}
+          onError={flash}
         />
         {noticeBar}
       </>

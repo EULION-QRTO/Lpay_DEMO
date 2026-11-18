@@ -1,4 +1,4 @@
-import { assetUrl } from './lib/config'
+
 import type { MenuResponse, MenuBoardResponse } from './lib/dto'
 
 export type Product = {
@@ -19,7 +19,7 @@ export function toProduct(m: MenuResponse): Product {
     name: m.name,
     price: m.price,
     description: m.description ?? '',
-    image: assetUrl(m.imageUrl),
+    image: m.imageUrl ?? undefined,
     soldOut: m.soldOut,
   }
 }

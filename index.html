@@ -6,15 +6,10 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
-    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
-    <!--
-      백엔드 API 도메인 — 운영 base URL은 항상 https://api.lapy.shop(.env.production, API_SPEC.md
-      참고). 로컬 개발(localhost:8080)에서는 어차피 안 쓰여서 무해하고, 운영에서는 JS가 파싱·실행
-      되기 전에 브라우저가 DNS·TCP·TLS를 미리 맺어둔다 — 첫 API 요청(entry) 지연을 줄인다.
-    -->
-    <link rel="preconnect" href="https://api.lapy.shop" crossorigin />
-    <!-- 매장 정보를 불러오기 전(또는 실패 시) 잠깐 보이는 기본값 — 로드되면 session.tsx가
-         "Lpay · {매장명}"으로 즉시 바꾼다. -->
+    <!-- 토스페이먼츠 SDK / 결제 승인 API — 결제 화면에서 쓰기 전에 미리 연결을 맺어 둔다. -->
+    <link rel="preconnect" href="https://js.tosspayments.com" crossorigin />
+    <link rel="preconnect" href="https://api.tosspayments.com" crossorigin />
+    <!-- 로드되면 session.tsx가 "Lpay · {매장명}"으로 바꾼다. -->
     <title>Lpay</title>
   </head>
   <body>
